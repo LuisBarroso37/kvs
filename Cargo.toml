@@ -1,0 +1,18 @@
+[package]
+name = "kvs"
+version = "0.1.0"
+authors = ["LuísBarroso"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+structopt = "0.3.21"
+serde = { version = "1.0.126", features = ["derive"] }
+serde_json = "1.0.64"
+
+[dev-dependencies]
+assert_cmd = "1.0.4"
+predicates = "1.0.8"
+tempfile = "3.2.0"
+walkdir = "2.3.2"
