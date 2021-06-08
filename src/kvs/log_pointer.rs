@@ -1,6 +1,8 @@
 use std::convert::From;
 use std::ops::Range;
 
+#[derive(Debug)]
+/// Pointer to a command's location in a log file
 pub struct LogPointer {
     pub log_file_id: u64,
     pub start_position: u64,

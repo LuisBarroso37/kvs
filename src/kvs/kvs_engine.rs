@@ -5,9 +5,7 @@ use std::fs::{self, File, OpenOptions, create_dir_all, read_dir};
 use std::ffi::OsStr;
 use serde_json::Deserializer;
 
-use crate::commands::{Command, SetArgs, RmArgs};
-use crate::{KvsError, LogPointer, Result};
-use crate::{BufReaderWithPos, BufWriterWithPos};
+use crate::{Command, KvsError, LogPointer, Result, KvsEngine, BufReaderWithPos, BufWriterWithPos};
 
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
@@ -20,6 +18,7 @@ const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 ///
 /// ```rust
 /// # use kvs::{KvStore, Result};
+/// # use kvs::KvsEngine;
 /// # fn try_main() -> Result<()> {
 /// use std::env::current_dir;
 /// let mut store = KvStore::open(current_dir()?)?;
@@ -29,6 +28,7 @@ const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct KvStore {
     /// Directory for saving log files.
     path: PathBuf,
@@ -95,114 +95,6 @@ impl KvStore {
             index,
             uncompacted,
         })
-    }
-
-    /// Gets the string value of a given string key.
-    ///
-    /// Returns `None` if the given key does not exist.
-    ///
-    /// # Errors
-    ///
-    /// It returns `KvsError::UnexpectedCommand` if the given command is not a Set command.
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        match self.index.get(&key) {
-            Some(cmd) => {
-                // Retrieve reader for log file to which the log pointer refers to 
-                let reader = self.readers.get_mut(&cmd.log_file_id).expect("Log reader not found");
-
-                // Set the starting position to start reading the command from the log file
-                reader.seek(SeekFrom::Start(cmd.start_position))?;
-
-                // Create a smaller reader that will only read the bytes of the command
-                let cmd_reader = reader.take(cmd.len);
-
-                // If retrieved command is a Set command, return the value associated with it
-                if let Command::Set(args) = serde_json::from_reader(cmd_reader)? {
-                    Ok(Some(args.value))
-                } else {
-                    Err(KvsError::UnexpectedCommand)
-                }
-            }, 
-            None => Ok(None)
-        }
-    }
-
-    /// Sets the value of a string key to a string.
-    ///
-    /// If the key already exists, the previous value will be overwritten.
-    ///
-    /// # Errors
-    ///
-    /// It propagates I/O or serialization errors while writing to the log
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        let cmd = Command::Set(SetArgs {
-            key: key.clone(),
-            value
-        });
-        
-        // Get last byte's position in the log file
-        let pos = self.writer.pos;
-        
-        // Serialize the command and append it to the file
-        serde_json::to_writer(&mut self.writer, &cmd)?;
-        self.writer.flush()?;
-
-        // Create log pointer for the appended command
-        let end_pos = self.writer.pos; // Get new last byte's position in the log file
-        let value: LogPointer = (self.current_log_id, pos..end_pos).into();
-        
-        // Insert log pointer in the in-memory index map
-        // If the key already existed, add the bytes of the old value to the uncompacted property
-        if let Some(old_cmd) = self.index.insert(key, value) {
-            self.uncompacted += old_cmd.len;
-        };
-
-        // Perform compaction if uncompacted property is bigger than the defined threshold
-        if self.uncompacted > COMPACTION_THRESHOLD {
-            self.compact()?;
-        }
-
-        Ok(())
-    }
-
-    /// Removes a given key.
-    ///
-    /// # Errors
-    ///
-    /// It returns `KvsError::KeyNotFound` if the given key is not found.
-    ///
-    /// It propagates I/O or serialization errors while writing to the log.
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        match self.index.remove(&key) {
-            Some(cmd) => {
-                // Add removed command's length to the uncompacted property
-                self.uncompacted += cmd.len;
-        
-                // Get last byte's position in the log file
-                let pos = self.writer.pos;
-                
-                // Remove command to be added to the log file
-                let cmd = Command::Rm(RmArgs { key: key.clone() });
-                
-                // Serialize the command and append it to the file
-                serde_json::to_writer(&mut self.writer, &cmd)?;
-                self.writer.flush()?;
-
-                // Get new last byte's position in the log file
-                let end_pos = self.writer.pos;
-                
-                // Add appended command's length to the uncompacted property
-                self.uncompacted += end_pos - pos;
-
-                // Perform compaction if uncompacted property is bigger than the defined threshold
-                if self.uncompacted > COMPACTION_THRESHOLD {
-                    self.compact()?;
-                }
-
-                Ok(())
-            },
-            None => Err(KvsError::KeyNotFound)
-        }
     }
 
     /// Compaction is performed by going through the log files, finding all the Set commands
@@ -281,6 +173,116 @@ impl KvStore {
     }
 }
 
+impl KvsEngine for KvStore {
+    /// Gets the string value of a given string key.
+    ///
+    /// Returns `None` if the given key does not exist.
+    ///
+    /// # Errors
+    ///
+    /// It returns `KvsError::UnexpectedCommand` if the given command is not a Set command.
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        match self.index.get(&key) {
+            Some(cmd) => {
+                // Retrieve reader for log file to which the log pointer refers to 
+                let reader = self.readers.get_mut(&cmd.log_file_id).expect("Log reader not found");
+
+                // Set the starting position to start reading the command from the log file
+                reader.seek(SeekFrom::Start(cmd.start_position))?;
+
+                // Create a smaller reader that will only read the bytes of the command
+                let cmd_reader = reader.take(cmd.len);
+
+                // If retrieved command is a Set command, return the value associated with it
+                if let Command::Set { value, ..} = serde_json::from_reader(cmd_reader)? {
+                    Ok(Some(value))
+                } else {
+                    Err(KvsError::UnexpectedCommand)
+                }
+            }, 
+            None => Ok(None)
+        }
+    }
+
+    /// Sets the value of a string key to a string.
+    ///
+    /// If the key already exists, the previous value will be overwritten.
+    ///
+    /// # Errors
+    ///
+    /// It propagates I/O or serialization errors while writing to the log
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        let cmd = Command::Set {
+            key: key.clone(),
+            value
+        };
+        
+        // Get last byte's position in the log file
+        let pos = self.writer.pos;
+        
+        // Serialize the command and append it to the file
+        serde_json::to_writer(&mut self.writer, &cmd)?;
+        self.writer.flush()?;
+
+        // Create log pointer for the appended command
+        let end_pos = self.writer.pos; // Get new last byte's position in the log file
+        let value: LogPointer = (self.current_log_id, pos..end_pos).into();
+        
+        // Insert log pointer in the in-memory index map
+        // If the key already existed, add the bytes of the old value to the uncompacted property
+        if let Some(old_cmd) = self.index.insert(key, value) {
+            self.uncompacted += old_cmd.len;
+        };
+
+        // Perform compaction if uncompacted property is bigger than the defined threshold
+        if self.uncompacted > COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
+
+        Ok(())
+    }
+
+    /// Removes a given key.
+    ///
+    /// # Errors
+    ///
+    /// It returns `KvsError::KeyNotFound` if the given key is not found.
+    ///
+    /// It propagates I/O or serialization errors while writing to the log.
+    fn remove(&mut self, key: String) -> Result<()> {
+        match self.index.remove(&key) {
+            Some(cmd) => {
+                // Add removed command's length to the uncompacted property
+                self.uncompacted += cmd.len;
+        
+                // Get last byte's position in the log file
+                let pos = self.writer.pos;
+                
+                // Remove command to be added to the log file
+                let cmd = Command::Remove { key: key.clone() };
+                
+                // Serialize the command and append it to the file
+                serde_json::to_writer(&mut self.writer, &cmd)?;
+                self.writer.flush()?;
+
+                // Get new last byte's position in the log file
+                let end_pos = self.writer.pos;
+                
+                // Add appended command's length to the uncompacted property
+                self.uncompacted += end_pos - pos;
+
+                // Perform compaction if uncompacted property is bigger than the defined threshold
+                if self.uncompacted > COMPACTION_THRESHOLD {
+                    self.compact()?;
+                }
+
+                Ok(())
+            },
+            None => Err(KvsError::KeyNotFound)
+        }
+    }
+}
+
 /// Get sorted vector of log file ids inside the given directory
 fn sort_log_files(path: &PathBuf) -> Result<Vec<u64>> {
     let mut file_ids: Vec<u64> = read_dir(&path)?
@@ -319,16 +321,16 @@ fn load_log_file(
         let end_pos = stream.byte_offset() as u64; // How many bytes were read from the iteration
 
         match cmd? {
-            Command::Set(args) => {
+            Command::Set { key, .. } => {
                 // Insert returns None if key-value pair did not exist
                 // or returns the previous value if it already existed
-                if let Some(old_cmd) = index.insert(args.key, (id, pos..end_pos).into()) {
+                if let Some(old_cmd) = index.insert(key, (id, pos..end_pos).into()) {
                     // Add old command's bytes to uncompacted counter
                     uncompacted += old_cmd.len;
                 }
             },
-            Command::Rm(args) => {
-                if let Some(old_cmd) = index.remove(&args.key) {
+            Command::Remove { key } => {
+                if let Some(old_cmd) = index.remove(&key) {
                     // Add old command's bytes to uncompacted counter
                     uncompacted += old_cmd.len;
                 };
